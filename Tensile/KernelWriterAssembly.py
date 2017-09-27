@@ -1469,7 +1469,7 @@ class KernelWriterAssembly(KernelWriter):
       # nwg0
       nwg0 = self.vgprScratch.checkOut(1)
       if self.vgprScratch.overflowed(): kStr += "s_endpgm\n"
-      tmpSgpr = self.getTmpSgpr(1)
+      tmpSgpr = self.getTmpSgpr(2)
       kStr += "// nwg0 = (size%s + MT%s - 1) / MT%s;%s" \
           % (self.tileChar0, self.tileChar0, self.tileChar0, self.endLine)
       kStr += inst("v_mov_b32", vgpr(nwg0), sgpr("SizesFree+0"), "")
