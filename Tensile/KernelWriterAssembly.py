@@ -3521,6 +3521,11 @@ class KernelWriterAssembly(KernelWriter):
     goto label_End
     label_End
     """
+    if kernel["ProblemType"]["DataType"].isHalf():
+      self.alphaVgpr = self.vgprPool.checkOut(1)
+      self.betaVgpr = self.vgprPool.checkOut(1)
+      kStr += inst("v_mov_b32", vgpr(self.alphaVgpr), sgpr("Alpha"), "sgpr -> vgpr b/c op_sel")
+      kStr += inst("v_mov_b32", vgpr(self.betaVgpr), sgpr("Beta"), "sgpr -> vgpr b/c op_sel")
 
     ########################################
     # Vgprs
@@ -3651,12 +3656,19 @@ class KernelWriterAssembly(KernelWriter):
         if numElementsPerBatchLimitedBySgprs < numElementsPerBatch:
           numElementsPerBatch = numElementsPerBatchLimitedBySgprs 
 
+        if kernel["ProblemType"]["DataType"].isHalf():
+          # only do an even number of halves
+          numElementsPerBatch = (numElementsPerBatch/2)*2
+
+
         # if no atomics and no edge, then write whole vectors
-        if not atomic and not edge:
-          numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
-          #print "  NumVectorsPerBatch", numVectorsPerBatch
-          numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
-          #print "  NumElementsPerBatch", numElementsPerBatch
+        #if not atomic and not edge:
+        #  numVectorsPerBatch = numElementsPerBatch / kernel["GlobalWriteVectorWidth"]
+        #  print "GlobalWriteVectorWidth", kernel["GlobalWriteVectorWidth"]
+        #  print "NumElementsPerBatch", numElementsPerBatch
+        #  print "NumVectorsPerBatch", numVectorsPerBatch
+        #  numElementsPerBatch = numVectorsPerBatch * kernel["GlobalWriteVectorWidth"]
+        #  #print "  NumElementsPerBatch", numElementsPerBatch
         numBatches = max(1, (len(elements)+numElementsPerBatch-1) / numElementsPerBatch)
         for batchIdx in range(0, numBatches):
           elementStartIdx = batchIdx * numElementsPerBatch
@@ -3816,10 +3828,15 @@ class KernelWriterAssembly(KernelWriter):
     kStr += self.comment("rC *= alpha")
     for elementIdx in range(0, len(batchElements)):
       sumIdx = elementSumIdx[elementIdx]
-      kStr += inst("v_mul_f32", vgpr(sumIdx), sgpr("Alpha"), vgpr(sumIdx), "*= alpha" )
+      if kernel["ProblemType"]["DataType"].isHalf():
+        kStr += inst("v_mul_f16", vgpr(sumIdx/2), vgpr(self.alphaVgpr), vgpr(sumIdx/2), "*= alpha")
+      elif kernel["ProblemType"]["DataType"].isSingle():
+        kStr += inst("v_mul_f32", vgpr(sumIdx), sgpr("Alpha"), vgpr(sumIdx), "*= alpha" )
+      elif kernel["ProblemType"]["DataType"].isDouble():
+        kStr += inst("v_mul_f64", vgpr(sumIdx*2,2), sgpr("Alpha",2), vgpr(sumIdx*2,2), "*= alpha")
 
     ########################################
-    # Atomic
+    # Atomic - f32 only
     ########################################
     # flat_atomic_cmpswap tmp addr data
     # tmp = mem[addr]
@@ -3869,14 +3886,9 @@ class KernelWriterAssembly(KernelWriter):
           kStr += inst("s_mov_b64", "exec", sgpr(mask,2), "sgprs -> exec" )
 
         # for atomic, data[1] = original c, data[0] = new c
-        if beta:
-          # data+0 = new c = old c + rC
-          kStr += inst("v_add_f32", vgpr(data+0), vgpr(data+1), vgpr(sumIdx), \
-              "sum*alpha + C*beta")
-        else:
-          # data+0 = new c = old c + rC
-          kStr += inst("v_add_f32", vgpr(data+0), vgpr(data+1), vgpr(sumIdx), \
-              "sum*alpha + C*beta")
+        # data+0 = new c = old c + rC
+        # TODO - we currently assume that only f32 can have atomics
+        kStr += inst("v_add_f32", vgpr(data+0), vgpr(data+1), vgpr(sumIdx), "sum*alpha + C*beta")
 
         # attempt write
         kStr += "flat_atomic_cmpswap %s, %s, %s %s    // %s%s" % ( vgpr(tmpVgpr), vgpr(addr,2), \
@@ -4015,13 +4027,41 @@ class KernelWriterAssembly(KernelWriter):
           kStr += inst("s_mov_b64", "exec", sgpr(mask,2), "sgprs -> exec" )
 
         if beta:
-          # data+0 = new c = old c*beta
-          kStr += inst("v_mul_f32", vgpr(data+0), sgpr("Beta"), vgpr(data+0), \
-              "%s = C*beta"%vgpr(data+0) )
-          # data+0 = new c = old c*beta + rC
-          kStr += inst("v_add_f32", vgpr(sumIdx), vgpr(data+0), vgpr(sumIdx), \
-              "sum*alpha + C*beta")
-        kStr += inst("flat_store_dword", vgpr(addr,2), vgpr(sumIdx), "store C" )
+          if kernel["ProblemType"]["DataType"].isHalf():
+            if sumIdx%2==0:
+              # data+0 = new c = old c*beta
+              kStr += inst("v_pk_mul_f16", vgpr(data+0), vgpr(self.betaVgpr), vgpr(data+0), \
+                  "%s = C*beta"%vgpr(data+0))
+              # data+0 = new c = old c*beta + rC
+              kStr += inst("v_pk_add_f16", vgpr(sumIdx/2), vgpr(data+0), vgpr(sumIdx/2), \
+                  "sum*alpha + C*beta")
+            else:
+              pass # add will have been done previously
+          elif kernel["ProblemType"]["DataType"].isSingle():
+            # data+0 = new c = old c*beta
+            kStr += inst("v_mul_f32", vgpr(data+0), sgpr("Beta"), vgpr(data+0), \
+                "%s = C*beta"%vgpr(data+0) )
+            # data+0 = new c = old c*beta + rC
+            kStr += inst("v_add_f32", vgpr(sumIdx), vgpr(data+0), vgpr(sumIdx), \
+                "sum*alpha + C*beta")
+          elif kernel["ProblemType"]["DataType"].isDouble():
+            # data+0 = new c = old c*beta
+            kStr += inst("v_mul_f64", vgpr(data+0,2), sgpr("Beta",2), vgpr(data+0,2), \
+                "%s = C*beta"%vgpr(data+0,2) )
+            # data+0 = new c = old c*beta + rC
+            kStr += inst("v_add_f64", vgpr(sumIdx*2,2), vgpr(data+0,2), vgpr(sumIdx*2,2), \
+                "sum*alpha + C*beta")
+
+        if kernel["ProblemType"]["DataType"].isHalf():
+          if sumIdx%2:
+            #kStr += inst("flat_store_short_d16_hi", vgpr(addr,2), vgpr(sumIdx/2), "store C" ) # FIXME need d16_hi
+            kStr += inst("flat_store_short", vgpr(addr,2), vgpr(sumIdx/2), "store C" )
+          else:
+            kStr += inst("flat_store_short", vgpr(addr,2), vgpr(sumIdx/2), "store C" )
+        elif kernel["ProblemType"]["DataType"].isSingle():
+          kStr += inst("flat_store_dword", vgpr(addr,2), vgpr(sumIdx), "store C" )
+        elif kernel["ProblemType"]["DataType"].isDouble():
+          kStr += inst("flat_store_dwordx2", vgpr(addr,2), vgpr(sumIdx*2,2), "store C" )
 
       if edge: # subsequent batch must start with full exec mask
         kStr += inst("s_mov_b64", "exec", sgpr(fullExecMaskSgpr,2), "full mask -> exec" )
